@@ -1,0 +1,35 @@
+# --- Paths & I/O ---
+num_proc: 1                 # Parallel workers for HuggingFace datasets .map() during tokenization
+cache_dir: cache/           # Root directory for raw and processed dataset caches
+log_dir: logs/              # Directory for training log files
+wandb_log_dir: wandb/       # Directory for Weights & Biases local run files
+ckpt_dir: ckpt/             # Directory where best model checkpoints are saved
+
+# --- Weights & Biases ---
+run_id: genrec_default      # W&B run name (also used as prefix for log/checkpoint filenames)
+wandb_entity: ~             # W&B team/username; null uses your default entity
+wandb_project: RPG_Baseline_Beauty  # W&B project name; null falls back to an auto-generated config hash
+wandb_tags: []              # Optional list of W&B tags for grouping runs
+wandb_notes: ~              # Optional free-text note attached to the W&B run
+
+# --- Reproducibility ---
+rand_seed: 2024             # Random seed for Python, NumPy, PyTorch, and HuggingFace Accelerate
+reproducibility: True       # If True, disables cuDNN benchmark and enables deterministic ops
+reseed_before_test: False    # If True, reset RNG to rand_seed before test eval
+
+# --- Training ---
+train_batch_size: 256       # Batch size during training
+eval_batch_size: 32         # Batch size during validation and test evaluation
+lr: 0.0003                  # AdamW learning rate
+weight_decay: 0.0           # L2 weight decay for AdamW
+warmup_steps: 10000         # Linear LR warmup steps before cosine decay
+steps: ~                    # Total optimizer steps; if null, uses epochs * batches-per-epoch
+epochs: 150                 # Number of training epochs (used when steps is null)
+max_grad_norm: 1.0          # Gradient clipping norm; set to null to disable clipping
+eval_interval: 1            # Run validation every n epochs
+patience: 20                # Early stopping: stop after n epochs without val_metric improvement; null to disable
+
+# --- Evaluation metrics ---
+topk: [5, 10, 15, 20, 30, 50]                # Cutoffs k for recall@k and ndcg@k
+metrics: [ndcg,recall]      # Metrics to compute during evaluation
+val_metric: ndcg@10         # Metric used for model selection and early stopping

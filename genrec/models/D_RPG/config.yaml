@@ -1,0 +1,60 @@
+# Upgraded version
+wandb_tags: [D_RPG]     # W&B tags
+metadata: sentence                      # Item metadata mode for semantic ID construction (RPG requires 'sentence')
+
+# --- Sentence embedding model (used to build item semantic IDs via OPQ) ---
+#   Sentence T5
+# sent_emb_model: sentence-transformers/sentence-t5-base
+# sent_emb_dim: 768
+# sent_emb_pca: 128
+#   OpenAI Embedding Model
+sent_emb_model: text-embedding-3-large  # Model name for encoding item text metadata
+sent_emb_dim: 3072                      # Sentence embedding dimension
+sent_emb_pca: 512                       # Sentence embedding PCA dimension
+openai_api_key: ~
+
+sent_emb_batch_size: 512                # Batch size when encoding sentence embeddings
+
+# --- Training data windowing ---
+use_sliding_window: True                # If True, training uses sliding windows over each user sequence;
+                                        # if False, training uses only the last window (same as val/test)
+
+# --- GPT-2 backbone ---
+max_item_seq_len: 50                    # Max number of past items in an input sequence (context length)
+n_embd: 448                             # Hidden size of GPT-2 token embeddings and transformer layers
+n_layer: 2                              # Number of GPT-2 transformer blocks
+n_head: 4                               # Number of attention heads per layer
+n_inner: 1024                           # Size of the feed-forward inner layer (typically 4 * n_embd)
+activation_function: gelu_new           # Activation function inside GPT-2 MLP blocks
+resid_pdrop: 0.0                        # Dropout on residual connections
+embd_pdrop: 0.5                         # Dropout on token embeddings
+attn_pdrop: 0.5                         # Dropout on attention weights
+layer_norm_epsilon: 1e-12               # Epsilon for layer normalization
+initializer_range: 0.02                 # Stddev for weight initialization
+
+# --- Semantic ID (OPQ / Product Quantization) ---
+n_codebook: 32                          # Number of PQ sub-codebooks (= number of semantic digits per item)
+codebook_size: 256                      # Number of centroids per sub-codebook (must be a power of 2)
+opq_use_gpu: False                      # Whether to train/run FAISS OPQ on GPU
+opq_gpu_id: 0                           # GPU device id for FAISS when opq_use_gpu is True
+faiss_omp_num_threads: 32               # Number of OpenMP threads for FAISS CPU operations
+
+# --- RPG model & graph-constrained decoding ---
+use_graph_decoding_at_test: True        # Whether to use graph-constrained decoding at test time
+temperature: 0.03                       # Temperature scaling for digit-level logits (lower = sharper predictions)
+num_beams: 100                          # Beam width per graph-propagation step during decoding
+n_edges: 200                            # Top-k nearest neighbors per item in the item-item similarity graph
+propagation_steps: 3                    # Number of graph traversal steps at inference time
+chunk_size: 1024                        # Block size when building the item-item similarity matrix (memory control)
+num_workers: 64                         # Reserved for DataLoader worker processes (not yet wired in pipeline)
+
+# --- DPQ configs ---
+dpq_v_dim: 28                           # The length of subvectors in V matrix
+quantizer_temperature: 1.0              # Initial Gumbel-Softmax temperature τ
+min_quantizer_temperature: 0.5          # Minimum Gumbel-Softmax temperature τ_min
+quantizer_temperature_decay: 1          # Gumbel-Softmax temperature decay rate γ
+sdud_lambda: 1.4                        # S-DUD λ parameter for loss smoothing
+freeze_sentence_embedding: True         # Whether to freeze the sentence embedding table
+
+# --- Debug ---
+tokenizer_debug_n_examples: 0             # Number of per-split examples to print detailed tokenization logs; 0 disables
