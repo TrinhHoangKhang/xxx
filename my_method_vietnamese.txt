@@ -1,0 +1,636 @@
+================================================================================
+        D-RPG: Lượng tử hóa tích khả vi cho mô hình gợi ý tuần tự
+                      dựa trên sinh (Generative Sequential Recommendation)
+================================================================================
+
+
+1. GIỚI THIỆU
+--------------------------------------------------------------------------------
+
+Tài liệu này mô tả D-RPG, một phiên bản nâng cấp của mô hình gợi ý tuần tự
+RPG (Residual Product-quantized Generative). RPG thuộc mô hình (paradigm)
+"gợi ý sinh" (generative recommendation), trong đó mỗi sản phẩm (item) trong
+danh mục không được biểu diễn bằng một số nguyên ID đơn thuần mà bằng một
+semantic ID gọn — một chuỗi mã rời rạc được tạo ra bởi Lượng tử hóa Tích
+(Product Quantization — PQ) trên các embedding nội dung của sản phẩm. Sau đó,
+một mô hình ngôn ngữ GPT-2 được huấn luyện để dự đoán tự hồi quy
+(autoregressively) semantic ID của sản phẩm tiếp theo mà người dùng sẽ tương
+tác, dựa trên chuỗi sản phẩm mà người dùng đã tương tác trước đó.
+
+Hạn chế chính của RPG là các semantic ID bị đóng băng sau bước tiền xử lý
+ngoại tuyến. Các phép gán codebook được tính một lần bởi FAISS OPQ, lưu vào
+bộ nhớ đệm (cache) trên đĩa, và không bao giờ được cập nhật lại trong quá
+trình huấn luyện mô hình. Điều này có nghĩa là chất lượng lượng tử hóa — mức
+độ các mã rời rạc phản ánh sự tương đồng giữa các sản phẩm — bị tách rời
+khỏi mục tiêu gợi ý. Nếu lượng tử hóa ban đầu tạo ra các phép gán kém
+(ví dụ: đặt các sản phẩm không tương đồng vào cùng một mã, hoặc phân mảnh
+các sản phẩm tương đồng sang các mã khác nhau), mô hình phía sau không có cơ
+chế nào để sửa lại điều này.
+
+D-RPG giải quyết vấn đề này bằng cách biến toàn bộ quy trình lượng tử hóa
+thành khả vi (differentiable) và huấn luyện được từ đầu đến cuối (end-to-end).
+Thay vì tra cứu các mã đã lưu sẵn, D-RPG đưa embedding câu của mỗi sản phẩm
+qua một module Lượng tử hóa Tích Khả vi (Differentiable Product Quantization —
+DPQ) tại mỗi lần forward pass. Thông qua kỹ thuật Ước lượng Truyền thẳng
+(Straight-Through Estimator — STE), tiêm nhiễu Gumbel-Softmax, và lịch trình
+giảm nhiễu tự động, các codebook, ma trận xoay, và transformer phía sau đều
+được tối ưu đồng thời dưới một hàm mất mát gợi ý duy nhất.
+
+
+2. KIẾN THỨC NỀN: MÔ HÌNH RPG GỐC
+--------------------------------------------------------------------------------
+
+Trước khi mô tả bản nâng cấp, chúng ta xem xét chi tiết RPG để các thay đổi
+được rõ ràng.
+
+2.1 Xây dựng Semantic ID (Ngoại tuyến, Đóng băng)
+
+RPG sử dụng Optimized Product Quantization (OPQ, qua FAISS) để chuyển đổi
+embedding câu của mỗi sản phẩm thành một semantic ID gọn. Quy trình như sau:
+
+  1. Mã hóa metadata sản phẩm (tiêu đề, mô tả, v.v.) thành một vector dày đặc
+     bằng mô hình embedding câu (ví dụ: SentenceTransformer hoặc OpenAI
+     text-embedding-3).
+
+  2. Tùy chọn áp dụng PCA với whitening để giảm chiều.
+
+  3. Huấn luyện một chỉ mục FAISS OPQ trên các sản phẩm trong tập huấn luyện.
+     OPQ đồng thời học:
+     - Một ma trận xoay R (d × d) để căn chỉnh không gian embedding sao cho
+       mỗi khối sub-vector không tương quan với nhau,
+     - Một Product Quantizer với n_digit codebook, mỗi codebook có kích thước
+       codebook_size.
+
+  4. Lượng tử hóa mọi sản phẩm để thu được mã PQ — một bộ n_digit số nguyên,
+     mỗi số trong khoảng [0, codebook_size). Các mã này chính là semantic ID
+     của sản phẩm.
+
+  5. Ánh xạ semantic ID sang token ID bằng cách dịch chuyển mỗi chữ số:
+         token[k] = code[k] + k * codebook_size + 1
+     Điều này tạo ra một từ vựng phẳng trong đó chữ số 0 chiếm các token
+     1..256, chữ số 1 chiếm các token 257..512, v.v. (với codebook_size=256).
+
+  6. Lưu ánh xạ item→tokens vào đĩa. Từ thời điểm này trở đi, các semantic ID
+     là các giá trị tra cứu tĩnh.
+
+Điểm then chốt: một khi đã lưu cache, cả ma trận xoay R lẫn các tâm
+(centroids) của codebook đều không được cập nhật trong quá trình huấn luyện.
+Mô hình hoàn toàn nằm phía sau bước lượng tử hóa đã đóng băng.
+
+2.2 Bảng Embedding Token
+
+RPG lưu toàn bộ từ vựng (tất cả chữ số của tất cả codebook, cộng các token
+đặc biệt) trong một bảng nn.Embedding duy nhất — embedding token từ của GPT-2
+(wte). Mỗi chữ số k và codeword c có vector embedding học được riêng.
+
+Để biểu diễn một sản phẩm trong chuỗi đầu vào, RPG tra cứu n_digit token ID
+của sản phẩm từ bảng cache, lấy n_digit vector embedding từ wte, và lấy trung
+bình (mean-pool) chúng thành một vector duy nhất:
+
+    input_embs = GPT2.wte(item_id2tokens[item_id]).mean(dim=-2)
+
+Vector trung bình này chính là thứ mà transformer GPT-2 nhìn thấy như
+"embedding từ" cho sản phẩm đó.
+
+2.3 Xương sống Transformer GPT-2
+
+Mô hình GPT-2 xử lý chuỗi các embedding sản phẩm đã mean-pool bằng cơ chế
+self-attention nhân quả (causal), tạo ra các trạng thái ẩn ngữ cảnh hóa
+(contextualized hidden states) h_t cho mỗi vị trí t.
+
+2.4 Các Đầu Dự đoán (Prediction Heads)
+
+RPG sử dụng n_digit đầu dự đoán độc lập (một cho mỗi chữ số). Mỗi đầu là một
+ResBlock (kết nối tắt: x + SiLU(Linear(x)), khởi tạo bằng không nên ban đầu
+hoạt động như hàm đồng nhất). Mỗi đầu biến đổi h_t thành một truy vấn
+(query) dành riêng cho chữ số đó:
+
+    q_t^(k) = PredHead_k(h_t)      với k = 0, ..., n_digit - 1
+
+2.5 Hàm Mất mát Theo Từng Chữ số (Per-Digit Loss)
+
+Với mỗi chữ số k, RPG tính độ tương đồng cosine giữa truy vấn đã chuẩn hóa
+q_t^(k) và các embedding wte đã chuẩn hóa của codebook thứ k:
+
+    logits_k = (q_t^(k) / ||q_t^(k)||) · (E_k / ||E_k||)^T / temperature
+
+trong đó E_k là lát cắt (codebook_size × n_embd) của wte cho chữ số k. Hàm
+cross-entropy được tính cho mỗi chữ số so với mã ground-truth, và hàm mất mát
+cuối cùng là trung bình trên tất cả n_digit chữ số:
+
+    L = (1 / n_digit) * Σ_k CE(logits_k, gt_code_k)
+
+2.6 Sinh (Generation) — Suy luận (Inference)
+
+Khi suy luận, RPG tính điểm log-softmax theo từng chữ số và nối chúng thành
+một vector token_logits duy nhất. Với mỗi sản phẩm ứng viên, nó thu thập
+log-xác suất của n_digit mã và lấy trung bình:
+
+    score(item) = (1/n_digit) Σ_k log P(code_k(item) | h_t)
+
+Top-K sản phẩm có điểm cao nhất được trả về. Tùy chọn, có thể sử dụng chiến
+lược giải mã ràng buộc đồ thị (graph-constrained decoding), trong đó đồ thị
+tương đồng k-NN giữa các sản phẩm (xây dựng từ các embedding token) hướng dẫn
+tìm kiếm cục bộ.
+
+2.7 Tóm tắt Hạn chế của RPG
+
+  - Lượng tử hóa đóng băng: Mã OPQ không bao giờ được cập nhật trong quá
+    trình huấn luyện.
+  - Tối ưu gián tiếp: Mô hình học các embedding token phải đồng thời đóng vai
+    trò là đại diện codebook và đặc trưng đầu vào — hai vai trò có thể xung
+    đột nhau.
+  - Không có tín hiệu gradient đến codebook: Nếu một sản phẩm được gán vào
+    codeword kém, cách duy nhất là dịch chuyển embedding wte, chứ không phải
+    phép gán.
+
+
+3. D-RPG: MÔ HÌNH NÂNG CẤP
+--------------------------------------------------------------------------------
+
+D-RPG giữ nguyên kiến trúc bậc cao (embedding câu → mã rời rạc → GPT-2 →
+đầu dự đoán → chấm điểm sản phẩm tiếp theo) nhưng thay thế tra cứu đóng
+băng bằng một module lượng tử hóa khả vi hoàn toàn và tái cấu trúc hàm mất
+mát để hoạt động trong không gian embedding DPQ liên tục.
+
+3.1 Tổng quan Kiến trúc
+
+Luồng forward pass của D-RPG:
+
+  ┌─────────────────┐
+  │  Item ID (int)   │
+  └────────┬────────┘
+           │  Tra cứu nn.Embedding
+           ▼
+  ┌─────────────────┐
+  │ Embedding câu (d)│   ← lưu trong bảng embedding có thể học
+  └────────┬────────┘
+           │
+           ▼
+  ┌─────────────────────────────────────────────────────┐
+  │    Lượng tử hóa Tích Khả vi (DPQ)                   │
+  │                                                      │
+  │  1. Xoay:     x_rot = R(x)             [nn.Linear]  │
+  │  2. Tách:     x_sub = reshape thành n_digit sub-vec  │
+  │  3. Gán:      logits = x_sub · K^T     [tích vô hướng]│
+  │  4. Gumbel:   noisy = logits + σ·Gumbel (chỉ train) │
+  │  5. Mềm:     soft = softmax(noisy/τ) · V            │
+  │  6. Cứng:    hard = V[argmax(noisy)]                 │
+  │  7. STE:      ste = hard + soft - soft.detach()      │
+  └────────┬────────────────────────────────────────────┘
+           │  đầu ra ste  (n_digit * v_dim)
+           │
+           │  [phép chiếu đầu vào tùy chọn]
+           ▼
+  ┌─────────────────┐
+  │    GPT-2 (h_t)   │
+  └────────┬────────┘
+           │
+           ▼
+  ┌─────────────────────────┐
+  │  n_digit Đầu Dự đoán    │  (ResBlock cho mỗi chữ số, giống RPG)
+  └────────┬────────────────┘
+           │  trung bình các đầu + phép chiếu đầu ra
+           ▼
+  ┌──────────────────────────────────────┐
+  │  Truy xuất dày đặc: query · items^T  │  ← items cũng đi qua DPQ
+  │  Hàm mất mát CE trên tất cả items    │
+  └──────────────────────────────────────┘
+
+
+3.2 Bảng Embedding Câu
+
+Khác với RPG chỉ lưu các token ID rời rạc, D-RPG duy trì một bảng embedding
+câu đầy đủ dưới dạng nn.Embedding:
+
+    self.sent_emb_table = nn.Embedding.from_pretrained(sent_embs, ...)
+
+Bảng này được khởi tạo từ cùng các embedding câu dùng cho OPQ (ví dụ: đầu ra
+SentenceTransformer) và có thể tùy chọn tinh chỉnh (fine-tune) trong quá trình
+huấn luyện (được kiểm soát bởi freeze_sentence_embedding). Hàng 0 là vector
+không, đóng vai trò padding.
+
+Đây là sự khác biệt cơ bản: đường đi đầu vào của RPG là
+    item_id → mã đã cache → tra cứu wte → mean pool
+trong khi đường đi đầu vào của D-RPG là
+    item_id → embedding câu → forward pass DPQ → đầu ra STE
+
+
+3.3 Module Lượng tử hóa Tích Khả vi (DPQ)
+
+Module DPQ là đổi mới cốt lõi. Nó thay thế tra cứu FAISS đóng băng bằng một
+lớp lượng tử hóa khả vi, có thể huấn luyện. Nó chứa ba tập tham số có thể
+học:
+
+  (a) Ma trận xoay R — nn.Linear(d, d, bias=False)
+      Khởi tạo ấm (warm-initialized) từ ma trận xoay OPQ của FAISS.
+      Mục đích: căn chỉnh các chiều embedding sao cho mỗi khối sub-vector nắm
+      bắt thông tin độc lập, tương tự như phép xoay trước của OPQ.
+
+  (b) Codebook khóa K — nn.Parameter có shape (n_digit, codebook_size, sub_dim)
+      Khởi tạo ấm từ các tâm (centroids) PQ của FAISS.
+      Mục đích: xác định codeword nào mà mỗi sub-vector được gán vào.
+      Phép gán được tính bằng tích vô hướng: logits = x_sub · K^T.
+
+  (c) Codebook giá trị V — nn.Parameter có shape (n_digit, codebook_size, v_dim)
+      Khởi tạo ấm từ các tâm PQ (khi v_dim == sub_dim).
+      Mục đích: cung cấp biểu diễn đầu ra cho mỗi codeword. Việc tách K và V
+      cho phép không gian "khóa tra cứu" khác với không gian "giá trị đầu ra",
+      mang lại cho mô hình sự linh hoạt hơn (tương tự như phân tách key/value
+      trong cơ chế attention).
+
+Luồng forward pass DPQ cho tensor đầu vào x có shape (B, seq_len, d):
+
+  Bước 1 — Xoay:
+    x_rot = R(x)                                        (B, seq_len, d)
+
+  Bước 2 — Tách sub-vector:
+    x_sub = x_rot.view(B, seq_len, n_digit, sub_dim)    (B, seq_len, n_digit, sub_dim)
+
+  Bước 3 — Logit gán (tích vô hướng với codebook khóa):
+    logits = einsum('bsdi, dki -> bsdk', x_sub, K)      (B, seq_len, n_digit, codebook_size)
+
+  Bước 4 — Tiêm nhiễu Gumbel (chỉ khi huấn luyện):
+    gumbel = -log(-log(U))       trong đó U ~ Uniform(0,1)
+    noisy_logits = logits + σ * gumbel
+
+  Bước 5 — Xác suất mềm:
+    soft_probs = softmax(noisy_logits / τ, dim=-1)       (B, seq_len, n_digit, codebook_size)
+
+  Bước 6 — Tái tạo mềm (trung bình có trọng số trên các codeword giá trị):
+    soft = einsum('bsdk, dkv -> bsdv', soft_probs, V)    (B, seq_len, n_digit, v_dim)
+
+  Bước 7 — Tái tạo cứng (tra cứu codeword thắng từ V):
+    hard_codes = argmax(noisy_logits, dim=-1)             (B, seq_len, n_digit)
+    hard = V[digit, hard_codes[digit]]                    (B, seq_len, n_digit, v_dim)
+
+  Bước 8 — Ước lượng Truyền thẳng (STE):
+    ste = hard + soft - soft.detach()                     (B, seq_len, n_digit, v_dim)
+
+  Đầu ra được reshape thành (B, seq_len, n_digit * v_dim).
+
+
+3.4 Kỹ thuật Ước lượng Truyền thẳng (STE)
+
+Dòng STE xứng đáng được chú ý đặc biệt vì đây là cơ chế biến lượng tử hóa
+rời rạc thành khả vi:
+
+    ste = hard + soft - soft.detach()
+
+Giải thích ý nghĩa:
+
+  FORWARD PASS (Lan truyền xuôi):
+    soft - soft.detach() = 0   (tensor trừ bản sao detach của chính nó bằng không)
+    Do đó: ste = hard + 0 = hard
+    → Các lớp phía sau (GPT-2, đầu dự đoán) nhận được tái tạo cứng (rời rạc),
+      chính xác như thể ta thực hiện tra cứu VQ thông thường.
+
+  BACKWARD PASS (Lan truyền ngược):
+    hard không có gradient (argmax không khả vi).
+    soft.detach() không có gradient (nó đã được detach).
+    soft có gradient (softmax là khả vi).
+    Do đó: ∂ste/∂params = ∂soft/∂params
+    → Gradient chảy qua đường tái tạo mềm (liên tục), đến được các codebook
+      K và V, ma trận xoay R, và các embedding câu.
+
+Đây là insight then chốt: mô hình hoạt động rời rạc theo chiều xuôi (bảo toàn
+nút cổ chai thông tin của PQ), nhưng được huấn luyện liên tục theo chiều ngược
+(cho phép tối ưu dựa trên gradient tất cả tham số lượng tử hóa).
+
+
+3.5 Nhiễu Gumbel cho Khám phá
+
+Trong quá trình huấn luyện, nhiễu Gumbel được thêm vào các logit gán:
+
+    gumbel = -log(-log(U)),   U ~ Uniform(0,1)
+    noisy_logits = logits + σ * gumbel
+
+Phân phối Gumbel là phân phối nhiễu chuẩn cho kỹ thuật Gumbel-Softmax /
+Gumbel-Max. Nó có tính chất rằng argmax(logits + Gumbel) lấy mẫu từ phân
+phối phân loại (categorical) được định nghĩa bởi softmax(logits), thay vì
+luôn chọn mode.
+
+Tại sao điều này quan trọng:
+
+  (a) Khám phá: Không có nhiễu, phép gán sẽ luôn đi đến codeword có điểm cao
+      nhất. Nhiễu Gumbel đưa vào tính ngẫu nhiên, cho phép mô hình thỉnh
+      thoảng thử các codeword thay thế và phát hiện các phép gán tốt hơn.
+
+  (b) Ngăn chặn sụp đổ codebook (codebook collapse): Một chế độ thất bại nổi
+      tiếng của VQ là "sụp đổ codebook", khi chỉ một phần nhỏ codeword được
+      sử dụng và phần còn lại trở nên "chết". Bằng cách nhiễu loạn ngẫu nhiên
+      các phép gán, nhiễu Gumbel cho các codeword ít được sử dụng cơ hội được
+      chọn, nhận cập nhật gradient, và trở nên hữu ích.
+
+  (c) Lấy mẫu nhất quán: Kỹ thuật Gumbel-Max đảm bảo rằng các phép gán ngẫu
+      nhiên được hiệu chuẩn đúng — xác suất chọn codeword c tỷ lệ với
+      exp(logit_c), không phải đồng đều.
+
+Khi suy luận, không có nhiễu Gumbel nào được thêm vào (σ = 0 hiệu quả), và
+mô hình sử dụng argmax thuần túy cho các dự đoán xác định.
+
+
+3.6 Giảm Nhiễu: Lịch trình Tự Giảm Dựa trên Độ Không Chắc chắn (SDUD)
+
+D-RPG không sử dụng tỷ lệ nhiễu σ cố định. Thay vào đó, nó điều chỉnh σ
+dựa trên hàm mất mát huấn luyện hiện tại bằng lịch trình tự giảm:
+
+    running_loss ← 0.99 * running_loss + 0.01 * current_batch_loss  (EMA)
+    σ ← max(0,  √(running_loss) - λ)
+
+trong đó λ (sdud_lambda) là siêu tham số ngưỡng (mặc định: 1.4).
+
+Trực giác là:
+
+  - Đầu quá trình huấn luyện, loss cao (mô hình không chắc chắn), nên
+    √(loss) > λ và σ dương → nhiễu Gumbel mạnh khuyến khích khám phá.
+
+  - Khi huấn luyện tiến triển và loss giảm, √(loss) tiến gần λ, và σ co lại
+    về không → mô hình chuyển từ khám phá sang khai thác, ổn định các phép
+    gán.
+
+  - Khi √(loss) < λ, σ = 0 và mô hình ở chế độ khai thác thuần túy, không
+    có tính ngẫu nhiên trong phép gán.
+
+Đây là phương pháp tự thích ứng và không cần lịch trình nhiễu thủ công: mô
+hình tự động xác định khi nào đã học đủ để ngừng khám phá.
+
+Ngoài ra, D-RPG giảm nhiệt độ Gumbel-Softmax τ qua suy giảm lũy thừa vào
+cuối mỗi epoch huấn luyện:
+
+    τ ← max(τ_min, τ * τ_decay)
+
+τ thấp hơn làm xác suất mềm sắc nét hơn (gần với one-hot hơn), khiến tái
+tạo mềm gần hơn với tái tạo cứng, giảm sai số xấp xỉ STE. Đến cuối huấn
+luyện, τ gần τ_min và đường mềm phản ánh gần như chính xác đường cứng.
+
+
+3.7 Khởi tạo Ấm từ FAISS
+
+Khởi tạo ngẫu nhiên đơn thuần các tham số DPQ sẽ bỏ phí toàn bộ cấu trúc
+mà FAISS OPQ đã học và buộc mô hình phải khám phá lại từ đầu. D-RPG tránh
+điều này bằng cách khởi tạo ấm từ chỉ mục FAISS:
+
+  - Ma trận xoay R: khởi tạo từ ma trận xoay OPQ (phép biến đổi tuyến tính
+    mà FAISS đã học để giải tương quan các sub-vector).
+  - Codebook khóa K: khởi tạo từ các tâm PQ.
+  - Codebook giá trị V: khởi tạo từ các tâm PQ (khi v_dim bằng sub_dim).
+
+Điều này có nghĩa D-RPG bắt đầu từ chính xác cùng lượng tử hóa như RPG và
+chỉ có thể cải thiện từ đó. Tokenizer (D_RPGTokenizer) mở rộng RPGTokenizer
+để bổ sung:
+  1. Lưu trữ toàn bộ embedding câu (không chỉ các mã),
+  2. Lưu chỉ mục FAISS vào đĩa (không chỉ các mã),
+  3. Trích xuất ma trận xoay và các tâm PQ từ chỉ mục đã lưu.
+
+
+3.8 Hàm Mất mát: Truy xuất Dày đặc Thay vì Phân loại Theo Chữ số
+
+RPG tính hàm cross-entropy riêng cho mỗi chữ số trong n_digit chữ số:
+
+    L_RPG = (1/n_digit) Σ_k CE(q_k · E_k^T / τ,  gt_code_k)
+
+trong đó q_k là đầu ra của đầu thứ k và E_k là lát cắt wte của codebook thứ k.
+Điều này phân tách bài toán thành n_digit nhiệm vụ phân loại độc lập.
+
+D-RPG thay thế bằng một hàm cross-entropy truy xuất dày đặc duy nhất:
+
+    query = normalize(OutputProj(mean_k(PredHead_k(h_t))))
+    item_embs = normalize(DPQ(sent_emb_table[1:]))       ← tất cả items
+    logits = query · item_embs^T / τ
+    L_D-RPG = CE(logits, gt_item_id - 1)
+
+Những khác biệt chính:
+
+  (a) Chấm điểm thống nhất: Thay vì chấm điểm mỗi chữ số độc lập, D-RPG
+      chấm điểm toàn bộ sản phẩm cùng một lúc. Truy vấn là trung bình của
+      tất cả đầu dành riêng cho chữ số, được chiếu vào không gian embedding
+      DPQ. Điều này cho phép tương tác chéo giữa các chữ số.
+
+  (b) Sản phẩm đi qua DPQ: Các embedding sản phẩm ứng viên không phải tra
+      cứu tĩnh — chúng được tạo ra bằng cách chạy embedding câu qua cùng
+      module DPQ (với STE). Điều này có nghĩa các biểu diễn sản phẩm cũng
+      có thể huấn luyện end-to-end.
+
+  (c) Gradient đến DPQ qua cả hai đường: Module DPQ nhận gradient từ hai
+      nguồn:
+      - Đường ĐẦU VÀO: thay đổi tham số DPQ thay đổi đầu vào cho GPT-2.
+      - Đường CHẤM ĐIỂM: thay đổi tham số DPQ thay đổi embedding sản phẩm
+        dùng để chấm điểm truy xuất.
+
+  (d) Softmax trên tất cả sản phẩm: Mẫu số của cross-entropy bao gồm tất cả
+      sản phẩm trong danh mục (không chỉ các codeword của một chữ số), cho
+      phân phối xác suất được hiệu chuẩn toàn cục hơn.
+
+
+3.9 Thay đổi trong Sinh (Generation) — Suy luận
+
+Khi suy luận, D-RPG cũng khác RPG:
+
+  RPG:
+    - Tính điểm log-softmax theo từng chữ số từ embedding token.
+    - Với mỗi sản phẩm ứng viên, thu thập log-xác suất của n_digit mã đã
+      cache và lấy trung bình.
+
+  D-RPG:
+    - Tính một vector truy vấn duy nhất bằng cách mean-pool các đầu ra
+      n_digit đầu và chiếu vào không gian DPQ.
+    - Tính embedding DPQ cứng cho tất cả sản phẩm qua _get_all_item_embs().
+    - Chấm điểm sản phẩm bằng độ tương đồng cosine: query · item_embs^T / τ.
+    - Trả về top-K theo điểm.
+
+Giải mã ràng buộc đồ thị cũng được điều chỉnh: trong RPG, đồ thị được xây
+dựng từ độ tương đồng embedding token theo từng chữ số; trong D-RPG, nó được
+xây dựng từ độ tương đồng embedding DPQ cứng. graph_propagation của D-RPG
+nhận item_logits (điểm trên sản phẩm) trực tiếp, thay vì token_logits (điểm
+trên mã theo từng chữ số).
+
+
+3.10 Các Lớp Chiếu Tùy chọn
+
+Nếu chiều đầu ra DPQ (n_digit * v_dim) khác với chiều ẩn GPT-2 (n_embd),
+D-RPG chèn các lớp chiếu tuyến tính:
+
+  - input_proj:  Đầu ra DPQ → Đầu vào GPT-2  (trước transformer)
+  - output_proj: Đầu ra GPT-2 → Không gian DPQ  (sau các đầu dự đoán)
+
+Khi các chiều khớp nhau (cấu hình mặc định trong đó v_dim = n_embd /
+n_digit), đây là các ánh xạ đồng nhất (identity).
+
+
+4. TÓM TẮT THAY ĐỔI: RPG so với D-RPG
+--------------------------------------------------------------------------------
+
+ ┌──────────────────────┬─────────────────────────┬─────────────────────────────┐
+ │       Khía cạnh      │          RPG            │           D-RPG             │
+ ├──────────────────────┼─────────────────────────┼─────────────────────────────┤
+ │ Semantic ID          │ Đóng băng (FAISS OPQ,   │ Có thể huấn luyện (module  │
+ │                      │ cache trên đĩa)         │ DPQ, cập nhật qua backprop)│
+ ├──────────────────────┼─────────────────────────┼─────────────────────────────┤
+ │ Biểu diễn sản phẩm  │ Mean-pool embedding     │ Đầu ra STE của DPQ trên    │
+ │ (đầu vào GPT-2)     │ token wte               │ embedding câu              │
+ ├──────────────────────┼─────────────────────────┼─────────────────────────────┤
+ │ Tham số lượng tử     │ Không (mã là giá trị    │ DPQ: xoay + codebook       │
+ │ hóa                  │ tra cứu tĩnh)           │ khóa/giá trị, đều học được │
+ ├──────────────────────┼─────────────────────────┼─────────────────────────────┤
+ │ Forward pass         │ Bỏ qua lượng tử hóa    │ Toàn bộ quy trình lượng tử │
+ │                      │ (dùng mã cache)         │ hóa mỗi forward pass       │
+ ├──────────────────────┼─────────────────────────┼─────────────────────────────┤
+ │ Gradient qua lượng   │ Không (mã là số nguyên, │ Có (STE: xuôi=cứng,        │
+ │ tử hóa?             │ không có đường gradient) │ ngược qua mềm)             │
+ ├──────────────────────┼─────────────────────────┼─────────────────────────────┤
+ │ Nhiễu Gumbel         │ Không                   │ Thêm khi huấn luyện;       │
+ │                      │                         │ ngăn sụp đổ codebook       │
+ ├──────────────────────┼─────────────────────────┼─────────────────────────────┤
+ │ Lịch trình nhiễu     │ Không áp dụng           │ SDUD: σ = max(0, √EMA - λ) │
+ │                      │                         │ + τ suy giảm lũy thừa      │
+ ├──────────────────────┼─────────────────────────┼─────────────────────────────┤
+ │ Hàm mất mát          │ CE theo từng chữ số     │ CE truy xuất dày đặc trên  │
+ │                      │ (n_digit nhiệm vụ phân  │ tất cả items (hàm mất mát  │
+ │                      │ loại độc lập)           │ thống nhất duy nhất)       │
+ ├──────────────────────┼─────────────────────────┼─────────────────────────────┤
+ │ Chấm điểm sản phẩm  │ Trung bình log-xác suất │ Tương đồng cosine giữa     │
+ │ (khi suy luận)       │ theo từng chữ số        │ query và embedding DPQ     │
+ ├──────────────────────┼─────────────────────────┼─────────────────────────────┤
+ │ Khởi tạo ấm          │ Không áp dụng           │ R, K, V từ FAISS OPQ      │
+ ├──────────────────────┼─────────────────────────┼─────────────────────────────┤
+ │ Tokenizer            │ RPGTokenizer: cache ánh  │ D_RPGTokenizer: cũng lưu   │
+ │                      │ xạ item→mã              │ embedding câu, chỉ mục     │
+ │                      │                         │ FAISS, trích xuất R/K/V    │
+ ├──────────────────────┼─────────────────────────┼─────────────────────────────┤
+ │ Giải mã đồ thị       │ Tương đồng từ embedding │ Tương đồng từ embedding    │
+ │                      │ token theo từng chữ số  │ DPQ cứng (end-to-end)      │
+ └──────────────────────┴─────────────────────────┴─────────────────────────────┘
+
+
+5. LÝ DO THIẾT KẾ
+--------------------------------------------------------------------------------
+
+5.1 Tại sao đi qua toàn bộ quy trình lượng tử hóa thay vì dùng ID đã cache?
+
+Trong RPG, mô hình chỉ nhìn thấy các mã rời rạc — nó không có quyền truy cập
+vào embedding liên tục gốc và không có cách nào biết lượng tử hóa tốt hay xấu.
+Bằng cách chạy lại lượng tử hóa tại mỗi forward pass, D-RPG cho bộ tối ưu hóa
+một đòn bẩy để cải thiện chính các mã. Nếu hàm mất mát cho biết "sản phẩm này
+được chấm điểm kém", gradient có thể chảy ngược qua STE, qua xác suất mềm,
+và vào các codebook và phép xoay, đẩy lượng tử hóa hướng đến các phép gán
+hữu ích hơn cho gợi ý.
+
+5.2 Tại sao dùng STE thay vì relaxation Gumbel-Softmax thuần túy?
+
+Gumbel-Softmax thuần túy (chỉ dùng đầu ra mềm) sẽ huấn luyện tốt nhưng tạo
+ra sự không khớp train-test: trong huấn luyện mô hình nhìn thấy tái tạo mềm
+(liên tục), nhưng khi test phải dùng mã cứng (rời rạc). STE đảm bảo rằng
+forward pass luôn dùng mã cứng, nên mô hình huấn luyện dưới cùng nút cổ chai
+rời rạc mà nó sẽ đối mặt khi suy luận. Đường mềm chỉ được dùng để cung cấp
+gradient.
+
+5.3 Tại sao tách riêng codebook Khóa (K) và Giá trị (V)?
+
+Trong PQ chuẩn, cùng các tâm đóng vai trò cả "khóa khớp" (codeword nào gần
+nhất?) lẫn "giá trị đầu ra" (vector nào ta xuất ra?). Bằng cách tách K và V,
+D-RPG cho phép tiêu chí gán khác với biểu diễn đầu ra. Các khóa có thể
+chuyên biệt hóa trong phân biệt các cụm sub-vector, trong khi các giá trị
+có thể chuyên biệt hóa trong việc tạo đặc trưng hữu ích cho mô hình GPT-2
+phía sau. Điều này tương tự như phân tách key-value trong cơ chế attention.
+
+5.4 Tại sao lại dùng nhiễu Gumbel cụ thể?
+
+Nhiễu Gumbel, kết hợp với argmax, tạo ra một mẫu chính xác từ phân phối
+phân loại softmax(logits). Các phân phối nhiễu khác (ví dụ: Gaussian) không
+có tính chất này và sẽ thiên lệch quá trình khám phá. Kỹ thuật Gumbel-Max
+đảm bảo rằng quá trình khám phá được hiệu chuẩn: codeword có logit cao hơn
+được khám phá thường xuyên hơn, nhưng tất cả codeword đều có xác suất khác
+không.
+
+5.5 Tại sao dùng giảm nhiễu SDUD?
+
+Lịch trình nhiễu cố định (ví dụ: giảm tuyến tính qua N epoch) yêu cầu điều
+chỉnh thủ công và không thể thích ứng với các tập dữ liệu hoặc động lực huấn
+luyện khác nhau. Lịch trình SDUD (σ = max(0, √EMA_loss - λ)) là tự thích ứng:
+nó sử dụng chính hàm mất mát của mô hình làm tín hiệu cho mức độ khám phá
+còn cần thiết. Khi mô hình bối rối (loss cao), nó khám phá nhiều hơn; khi mô
+hình tự tin (loss thấp), nó khai thác. Siêu tham số duy nhất là λ, đặt ngưỡng
+loss mà dưới đó khám phá dừng hoàn toàn.
+
+
+6. CHI TIẾT KỸ THUẬT
+--------------------------------------------------------------------------------
+
+6.1 Siêu tham số DPQ
+
+  - d (int): Chiều embedding câu (từ bộ mã hóa đã huấn luyện trước).
+  - n_digits (int): Số không gian con PQ (= n_codebook trong config).
+  - codebook_size (int): Số codeword mỗi không gian con.
+  - v_dim (int): Chiều của mỗi codeword giá trị (mặc định: n_embd / n_digits).
+  - sub_dim (int): d / n_digits, chiều của mỗi sub-vector khóa.
+
+6.2 Tham số Nhiệt độ và Nhiễu
+
+  - quantizer_temperature (τ): Nhiệt độ Gumbel-Softmax ban đầu (mặc định: 1.0).
+  - min_quantizer_temperature (τ_min): Sàn cho τ (mặc định: 0.1).
+  - quantizer_temperature_decay: Suy giảm nhân theo epoch (mặc định: 0.9).
+  - sdud_lambda (λ): Ngưỡng SDUD (mặc định: 1.4).
+  - σ: Tỷ lệ nhiễu Gumbel, được tính tự thích ứng từ EMA của loss huấn luyện.
+
+6.3 Tích hợp Vòng lặp Huấn luyện
+
+  Vào cuối mỗi epoch huấn luyện, phương thức on_train_epoch_end() của mô hình:
+    1. Gọi anneal_tau() để giảm τ.
+    2. Ghi nhận các giá trị τ và σ hiện tại để theo dõi.
+
+  Trong mỗi forward pass (khi huấn luyện):
+    1. Module DPQ nhận τ và σ hiện tại.
+    2. Nhiễu Gumbel được lấy mẫu và nhân tỷ lệ bởi σ.
+    3. Xác suất mềm được tính với nhiệt độ τ.
+    4. EMA loss huấn luyện được cập nhật, và σ được tính lại qua SDUD.
+
+6.4 Mở rộng D_RPGTokenizer
+
+  D_RPGTokenizer mở rộng RPGTokenizer với ba thuộc tính bổ sung:
+
+    - sent_embs (np.ndarray, shape (n_items, d)):
+      Embedding câu đầy đủ, đệm hàng không tại chỉ mục 0. Dùng để khởi tạo
+      sent_emb_table của mô hình.
+
+    - opq_rotation (np.ndarray, shape (d, d) hoặc None):
+      Ma trận xoay OPQ trích xuất từ chỉ mục FAISS. Dùng để khởi tạo ấm
+      lớp xoay của DPQ.
+
+    - pq_codebooks (np.ndarray, shape (n_digits, codebook_size, sub_dim) hoặc None):
+      Các tâm PQ trích xuất từ chỉ mục FAISS. Dùng để khởi tạo ấm codebook
+      K và V của DPQ.
+
+  Tokenizer lưu chỉ mục FAISS vào đĩa (ngoài các semantic ID) để các tham số
+  này có thể được trích xuất ngay cả khi chỉ mục được xây dựng lại.
+
+
+7. KẾT LUẬN
+--------------------------------------------------------------------------------
+
+D-RPG nâng cấp mô hình RPG từ quy trình "lượng tử hóa đóng băng + transformer
+phía sau" thành hệ thống khả vi end-to-end hoàn toàn. Đóng góp chính là module
+DPQ, thay thế tra cứu FAISS tĩnh bằng lớp lượng tử hóa có thể huấn luyện
+sử dụng:
+
+  1. Ước lượng Truyền thẳng (STE) để duy trì mã rời rạc trong forward pass
+     trong khi cho phép gradient chảy trong backward pass.
+
+  2. Tiêm nhiễu Gumbel để khuyến khích khám phá và ngăn chặn sụp đổ codebook.
+
+  3. Lịch trình nhiễu tự giảm (SDUD) tự động chuyển đổi từ khám phá sang
+     khai thác khi huấn luyện tiến triển.
+
+  4. Khởi tạo ấm từ các tham số FAISS OPQ để bắt đầu từ một nền lượng tử hóa
+     mạnh thay vì ngẫu nhiên.
+
+  5. Hàm mất mát truy xuất dày đặc thống nhất thay thế phân loại theo chữ số
+     bằng chấm điểm toàn sản phẩm, cho phép tương tác chéo giữa các chữ số
+     và gradient end-to-end qua cả đường đầu vào và đường chấm điểm.
+
+Những thay đổi này cho phép lượng tử hóa — cách các sản phẩm được biểu diễn
+dưới dạng mã rời rạc — được tối ưu đồng thời với mục tiêu gợi ý, thu hẹp
+khoảng cách giữa giai đoạn "cách sản phẩm được mã hóa" và "cách sản phẩm
+được gợi ý" tồn tại trong mô hình RPG gốc.
+
+================================================================================
