@@ -55,6 +55,7 @@ min_quantizer_temperature: 0.5          # Minimum Gumbel-Softmax temperature τ_
 quantizer_temperature_decay: 1          # Gumbel-Softmax temperature decay rate γ
 sdud_lambda: 1.4                        # S-DUD λ parameter for loss smoothing
 freeze_sentence_embedding: True         # Whether to freeze the sentence embedding table
+use_gumbel_noise: True                  # Ablation: set False to disable Gumbel noise during training (sigma fixed at 0)
 
 # --- Debug ---
 tokenizer_debug_n_examples: 0             # Number of per-split examples to print detailed tokenization logs; 0 disables

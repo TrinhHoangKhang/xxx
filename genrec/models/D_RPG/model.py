@@ -206,7 +206,8 @@ class D_RPG(AbstractModel):
         self.gumbel_tau_decay: float = config.get('quantizer_temperature_decay', 0.9)
 
         self.sdud_lambda = config.get('sdud_lambda', 1.4)
-        self.sigma = 1.0
+        self.use_gumbel_noise: bool = config.get('use_gumbel_noise', True)
+        self.sigma = 1.0 if self.use_gumbel_noise else 0.0
         self.running_loss = None
 
     def anneal_tau(self):
@@ -381,7 +382,7 @@ class D_RPG(AbstractModel):
             gt_ids = batch['labels'].view(-1)[label_mask] - 1
 
             l_gen = nn.CrossEntropyLoss()(item_logits, gt_ids)
-            if self.training:
+            if self.training and self.use_gumbel_noise:
                 current_loss = l_gen.item()
                 if self.running_loss is None:
                     self.running_loss = current_loss
