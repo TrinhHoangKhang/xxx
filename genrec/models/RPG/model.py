@@ -79,6 +79,20 @@ class RPG(AbstractModel):
             item_id2tokens[item_id] = torch.LongTensor(self.tokenizer.item2tokens[item])
         return item_id2tokens
 
+    def get_codebook_utilization(self):
+        import numpy as np
+        # item_id2tokens row 0 is padding; skip it.
+        # Global token index for digit d, codeword c is: d * codebook_size + c + 1
+        # So local 0-based codeword index = token_id - d * codebook_size - 1
+        codes = self.item_id2tokens[1:].cpu().numpy()          # (n_items-1, n_digits)
+        n_digits      = self.tokenizer.n_digit
+        codebook_size = self.tokenizer.codebook_size
+        counts = np.zeros((n_digits, codebook_size), dtype=np.int64)
+        for d in range(n_digits):
+            local = codes[:, d] - d * codebook_size - 1        # 0-based codeword indices
+            counts[d] = np.bincount(local, minlength=codebook_size)
+        return counts
+
     @property
     def n_parameters(self) -> str:
         #

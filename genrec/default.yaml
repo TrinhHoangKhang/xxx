@@ -4,6 +4,7 @@ cache_dir: cache/           # Root directory for raw and processed dataset cache
 log_dir: logs/              # Directory for training log files
 wandb_log_dir: wandb/       # Directory for Weights & Biases local run files
 ckpt_dir: ckpt/             # Directory where best model checkpoints are saved
+viz_dir: viz/               # Directory where codebook utilization heatmaps are saved
 
 # --- Weights & Biases ---
 run_id: genrec_default      # W&B run name (also used as prefix for log/checkpoint filenames)

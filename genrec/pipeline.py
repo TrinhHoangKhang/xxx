@@ -10,6 +10,7 @@ from genrec.model import AbstractModel
 from genrec.tokenizer import AbstractTokenizer
 from genrec.utils import get_config, init_seed, init_logger, init_device, \
     get_dataset, get_tokenizer, get_model, get_trainer, log
+from genrec.viz import snapshot_codebook_utilization
 
 
 class Pipeline:
@@ -112,10 +113,18 @@ class Pipeline:
             collate_fn=self.tokenizer.collate_fn['test']
         )
 
+        viz_dir = os.path.join(
+            self.config.get('viz_dir', 'viz/'),
+            self.config['dataset'],
+            self.config['model'],
+        )
+
         if self.eval_only:
             self.log("===============================================================================================================================")
             self.log("============================================== EVAL-ONLY MODE (SKIPPING TRAINING) =============================================")
             self.log("===============================================================================================================================")
+            if self.accelerator.is_main_process:
+                snapshot_codebook_utilization(self.model, label='static', save_dir=viz_dir)
             best_epoch, best_val_score = None, None
         else:
             train_dataloader = DataLoader(
@@ -131,11 +140,20 @@ class Pipeline:
                 collate_fn=self.tokenizer.collate_fn['val']
             )
 
+            # Snapshot codebook utilization before training (epoch 0 — initial state).
+            if self.accelerator.is_main_process:
+                snapshot_codebook_utilization(self.model, label='epoch_0', save_dir=viz_dir)
+
             self.log("===============================================================================================================================")
             self.log("=============================================== CALLING TRAINER.FIT ===========================================================")
             self.log("===============================================================================================================================")
             best_epoch, best_val_score = self.trainer.fit(train_dataloader, val_dataloader)
             self.log("-----------------------------------------------------------------")
+
+            # Snapshot codebook utilization after the last training epoch.
+            if self.accelerator.is_main_process:
+                final_model = self.accelerator.unwrap_model(self.trainer.model)
+                snapshot_codebook_utilization(final_model, label='final', save_dir=viz_dir)
 
             self.accelerator.wait_for_everyone()
 

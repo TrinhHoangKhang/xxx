@@ -237,6 +237,24 @@ class D_RPG(AbstractModel):
             item_id2tokens[item_id] = torch.LongTensor(self.tokenizer.item2tokens[item])
         return item_id2tokens
 
+    def get_codebook_utilization(self):
+        import numpy as np
+        was_training = self.training
+        self.eval()
+        with torch.no_grad():
+            # Run all item sentence embeddings through DPQ to get current hard assignments.
+            all_sent   = self.sent_emb_table.weight[1:].unsqueeze(0)         # (1, n_items-1, d)
+            hard_codes = self.dpq(all_sent, tau=self.gumbel_tau)['hard_codes']
+            hard_codes = hard_codes.squeeze(0).cpu().numpy()                  # (n_items-1, n_digits)
+        if was_training:
+            self.train()
+        n_digits      = self.dpq.n_digits
+        codebook_size = self.dpq.codebook_size
+        counts = np.zeros((n_digits, codebook_size), dtype=np.int64)
+        for d in range(n_digits):
+            counts[d] = np.bincount(hard_codes[:, d], minlength=codebook_size)
+        return counts
+
     def _get_all_item_embs(self) -> torch.Tensor:
         '''
         Returns normalized DPQ hard embeddings for all real items.
