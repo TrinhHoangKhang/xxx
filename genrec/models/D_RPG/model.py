@@ -207,6 +207,7 @@ class D_RPG(AbstractModel):
 
         self.sdud_lambda = config.get('sdud_lambda', 1.4)
         self.use_gumbel_noise: bool = config.get('use_gumbel_noise', True)
+        self.use_sigma_decay: bool = config.get('use_sigma_decay', True)
         self.sigma = 1.0 if self.use_gumbel_noise else 0.0
         self.running_loss = None
 
@@ -400,7 +401,7 @@ class D_RPG(AbstractModel):
             gt_ids = batch['labels'].view(-1)[label_mask] - 1
 
             l_gen = nn.CrossEntropyLoss()(item_logits, gt_ids)
-            if self.training and self.use_gumbel_noise:
+            if self.training and self.use_gumbel_noise and self.use_sigma_decay:
                 current_loss = l_gen.item()
                 if self.running_loss is None:
                     self.running_loss = current_loss
